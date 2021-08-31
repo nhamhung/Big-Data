@@ -6,3 +6,5 @@ This repository is for practice with DevOps including:
 - AWS
 - Scripting
 - Big Data
+
+![AWS Certified Cloud Practitioner Certificate](AWS_certificate.pdf)
