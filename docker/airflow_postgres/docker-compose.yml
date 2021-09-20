@@ -1,0 +1,24 @@
+version: '3.8'
+services:
+  db_1:
+      image: postgres
+      restart: always
+      environment:
+        POSTGRES_USER: root
+        POSTGRES_PASSWORD: root
+        POSTGRES_DB: source_db
+      ports:
+        - "5432:5432"
+      volumes:
+        - /home/nhamhung/DevOps/docker-test/postgres/sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+  db_2:
+      image: postgres
+      restart: always
+      environment:
+        POSTGRES_USER: root
+        POSTGRES_PASSWORD: root
+        POSTGRES_DB: target_db
+      ports:
+        - "5433:5432"
+      depends_on:
+        - "db_1"
