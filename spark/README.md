@@ -366,3 +366,99 @@ Heuristics:
 - ExecMemoryLargerThanNeeded
 - TooShortTasks
 - CPUTimeShorterThanComputeTime
+
+# Custom Heuristics
+  
+Heuristic rules in the form of pseudo-func with input (data required to check) and output (possible suggestions)
+
+## 1. High Impact rules based on experience with manual tuning:
+
+First, check the number of partitions so make sure it's at least sufficient for the number of cores as well as the heaviest stages. If the number of required partitions is very high, we can always enable spark.sql.adaptive.coalescePartitions so that lighter shuffle stages don't have too many partitions
+
+checkParallelism(numExecutors, numCores): Number of partitions should at least match the number of cores
+
+- Get degreeOfParallelism = numExecutors * numCores
+- Get minPartitionsNumParallelism = degreeOfParallelism
+- Return: minPartitionsNumParallelism
+
+checkShuffleSpill(allStagesStats): If there is shuffle spill, there should be at least enough partitions such that each partition size is within 200Mb to 1Gb range
+
+- Get stage with largestShuffleReadSize. 
+- If largestShuffleReadSize > 1TiB, then minPartitionsNumSpill = largestShuffleReadSize.toMb() / 200 (Mb) / 5 (each partition around 1GiB), maxPartitionsNumSpill = min(8000, largestShuffleReadSize.toMb() / 200 (Mb) (each partition around 200 Mb)). Here, 8000 is set to be the cap with using 500 executors each with 4 cores. Also, enable "spark.sql.adaptive.coalescePartitions" as minPartitionsNumSpill and maxPartitionsNumSpill are likely large, so we would want to coalesce down partitions dynamically
+- Else, minPartitionsNumSpill = max(200, largestShuffleReadSize.toMb() / 200 (Mb)). 
+- Return: minPartitionsNumSpill, maxPartitionsNumSpill
+
+getDesireNumberOfPartitions(minPartitionsNumParallelism, minPartitionsNumSpill, maxPartitionsNumSpill, currentPartitionsNum, mode=Resource Saving/Resource Optimization): The number of shuffle partitions sufficient to make use of all cores as well as preventing shuffle spill assuming no data skewness (all partitions spill equally)
+
+- If no spill across all stages: finalPartitionsNum = max(minPartitionsNumParallelism, currentPartitionsNum). This means that currentPartitionsNum are sufficient with no spillage, but still we should at least have minPartitionsNumParallelism to use up all existing cores. This step may consider reducing resources instead. So maybe we can have different modes such as resource saving/resource optimization. One note about resource optimization is that it will also reduce runtime and thus free up completed resources earlier.
+- If spillage: Get minPartitionsNumSpill, maxPartitionsNumSpill = checkShuffleSpill(allStagesStats). Then, finalPartitionsNum = minPartitionsNumSpill if mode is Resource Saving else maxPartitionsNumSpill
+- Return finalPartitionsNum
+
+The number of cores will influence the number of executors which also influence the amount of memory requested overall. We may either tune the number of cores according to memory requirement or just assume each executors will use 4 cores and only tune the amount of executor memory. For simplicity, currently if there is spillage the numCores will be set to 4 to meet the number of partitions, else numCores is not changed
+
+getNumberOfExecutorsAndCores(finalPartitionsNum, currNumCores, currNumExecutors): This method assumes if there are spillage, the number of partitions will be raised and thus, we will need more core. For simplicity, numCores is just set as 4 in that case so we can focus on tuning memory afterwards
+
+- If no spill: numCores = currNumCores, numExecutors = finalPartitionsNum / numCores
+- If spillage: numCores = 4, numExecutors = finalPartitionsNum / numCores
+Return numExecutors, numCores
+
+getEachExecutorMemory(totalCacheSize, currExecutorMemory, currMemoryFraction, currStorageFraction, numExecutors): Get enough executor memory for both storage and execution. For simplicity, does not attempt to change spark.memory.fraction=0.6 yet. We may experiment more and just raise this up by default because the other 0.4 is for User Memory which may not be necessary for our applications
+
+- Note: execution memory = storage memory = each executor memory * 0.6 (spark.memory.fraction) * 0.5 (spark.memory.storageFraction)
+- If no cacheSpill but shuffleSpill: minTotalExecutorMem = finalPartitionsNum * eachPartitionSizeFraction (200Mb to 1Gb / 1Gb) / 0.6, minEachExecutorMemShuffleSpill = minTotalExecutorMem / numExecutors
+- If cacheSpill: minTotalStorageMemoryRequired = totalCacheSize, minTotalStorageAndExecutionMemoryRequired = minTotalStorageMemoryRequired / 0.5, minTotalExecutorMemoryRequired = minTotalStorageAndExecutionMemory / 0.6. Thus, minEachExecutorMemCacheSpill = minTotalExecutorMemoryRequired / numExecutors
+Then, minEachExecutorMem = max(minEachExecutorMemShuffleSpill, minEachExecutorMemCacheSpill)
+- Return minEachExecutorMem
+
+getExecutorOverheadMemory(eachExecutorMem): Executor's off-heap memory for PySpark executor and other non-executor processes and overheads VM overheads, grows with executor size
+
+- Get minExecutorOverHeadMemory = eachExecutorMem * 0.1
+- Return minExecutorOverHeadMemory
+
+## 2. YARN Queue rules based on the notion of resources' relative abundance:
+
+The calculations below is more for determining the application's configuration before running. But could be modified to maybe extract the queue situation at that time
+
+getNumExecutors(queueStats)
+
+- Get queueMem, queueCores
+- Get memPerCore = queueMem / queueCores * memHungry 
+- Get coresPerExecutor = min(maxUsableMemoryPerContainer / memoryPerCore, 4). Cores per executors should be 4, unless there is insufficient memory in the container
+- Get memPerExecutor = max(1Gb, memPerCore * coresPerExecutor). Max amount of memory available for each executor given current queue condition
+- Get availableExecutors = allActiveNodes.map(node => min(node.availableNodeMemory/(memoryPerExecutor + overHead), node.AvailableNodeCores/CoresPerExecutor)).sum()
+- Get usableExecutors = min(availableExecutorsPerNode, queueMem/memoryPerExecutor, queueCores / coresPerExecutor). Further consider queue constraints to get true number of usable executors
+- Get neededExecutors = cacheSize / (memPerExecutor * storageFraction). 
+- Get finalExecutors = min(usableExecutors, neededExecutor * computeHungry)
+- Return finalExecutors
+
+getNumPartitions(numExecutors, coresPerExecutor, memPerExecutor, storageFraction, cacheSize)
+
+- minPartitions = numExecutors * coresPerExecutor
+- memPerTask = memPerExecutor * (1 - storageFraction) / coresPerExecutor
+- memPartitions = cacheSize / memPerTask
+- finalPartitions = max(minPartitions, memPartitions)
+- Return finalPartitions
+
+## 3. AQE rules:
+
+- As AQE is a combination of multiple optimizations which once enabled should work well with one another, we could assume that one there's enough reason to enable AQE, all of its features will be enabled as well. Here, there should be 2 reasons strong enough to enable AQE: very large partition size (requires dynamic coalesce) or very skewed data (requires dynamic skew handling). Especially for skewness, adjust other parameters would not be able to handle it effectively without wastage
+
+enableAQE(allStagesStats, skewSeverityThreshold, partitionsNumSeverityThreshold):
+
+- Get stagesWithSpills
+- Get exceedSkewSeverityThreshold = true/false: Analyse each of the stagesWithSpills, get each stage's min/median/max statistics for taskRunTime and taskShuffleReadBytes. Get max-to-median ratio and check if it > skewSeverityThreshold, then exceedSkewSeverityThreshold = true
+- Also, get requireInDepthChecking = true/false: Check max-to-median ratio, if it is too high or medianTaskTime = 0, there could be some severe problem with the key that will require further manual and in-depth inspection due to the unnatural skewness, such as in the case of having stress testing keys with an usually high number of records. Thus requireInDepthChecking = true
+- Get exceedPartitionsNumSeverityThreshold = true/false: Get finalPartitionNums = getDesireNumberOfPartitions(in part 1). If finalPartitionNums > partitionsNumSeverityThreshold, then exceedPartitionsNumSeverityThreshold = true
+- Return exceedSkewSeverityThreshold or requireInDepthChecking or exceedPartitionsNumSeverityThreshold
+
+getAdvisoryPartitionSizeInBytes():
+
+getAutoBroadcastJoinThreshold():
+
+getMinCoalescePartitionSize():
+
+getMaxShuffleHashJoinLocalMapThreshold():
+
+getSkewedPartitionThreshold():
+
+getSkewedPartitionFactor():
