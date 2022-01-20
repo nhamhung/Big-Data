@@ -1,10 +1,8 @@
 # DevOps
-This repository is for practice with DevOps including:
-- Docker
-- Scripting
-- Django
-- AWS
-- Scripting
-- Big Data
+This repository is for practice and research with DevOps and Spark including:
+- aws: Create a CloudFormation stack
+- docker: Migrate a database with Airflow and Docker Compose
+- scripting: Revisions of bash scripting
+- spark: In-depth research on Spark SQL's working and building automated performance tuning analyser tools for Spark
 
 ![AWS Certified Cloud Practitioner Certificate](AWS_certificate.png)
